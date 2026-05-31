@@ -1,0 +1,38 @@
+{
+  "name": "deepbook-trading-agent",
+  "version": "1.0.0",
+  "description": "AI-powered agentic trading library for DeepBook (Sui's native on-chain orderbook)",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "files": [
+    "dist"
+  ],
+  "scripts": {
+    "build": "tsc",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "demo": "tsx src/demo.ts",
+    "prepublishOnly": "pnpm build"
+  },
+  "keywords": [
+    "sui",
+    "deepbook",
+    "trading",
+    "defi",
+    "orderbook",
+    "prediction-markets",
+    "walrus",
+    "ptb"
+  ],
+  "license": "MIT",
+  "dependencies": {
+    "@mysten/sui": "^2.17.0",
+    "@mysten/walrus": "^1.1.0",
+    "typescript": "^5.4.0"
+  },
+  "devDependencies": {
+    "@types/node": "^20.0.0",
+    "tsx": "^4.7.0",
+    "vitest": "^1.6.0"
+  }
+}

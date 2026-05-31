@@ -1,0 +1,4 @@
+node_modules/
+dist/
+demo-video.mp4
+*.log
