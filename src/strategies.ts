@@ -21,6 +21,71 @@ import type {
   DepthLevel,
 } from './types.js';
 
+/* ─── Pure Money/Math Helpers ──────────────────────────────────────── */
+//
+// These are the money-critical formulas. They are exported as pure functions
+// (no I/O, no client) so they can be characterized and regression-tested in
+// isolation. The strategy classes below call them on the real execution path.
+
+/**
+ * Mid price from best bid/ask. Falls back to `fallback` when either side is
+ * empty/zero so downstream pricing never divides by or quotes around 0.
+ * Integer truncating division (matches BigInt semantics on-chain).
+ */
+export function computeMidPrice(
+  bestBid: bigint,
+  bestAsk: bigint,
+  fallback = 1000n
+): bigint {
+  return bestBid > 0n && bestAsk > 0n ? (bestBid + bestAsk) / 2n : fallback;
+}
+
+/**
+ * Symmetric market-making quote around mid. spread = round(mid * spreadFraction).
+ * Returns bid below mid and ask above mid by the spread.
+ */
+export function computeQuote(
+  midPrice: bigint,
+  spreadFraction: number
+): { spread: bigint; bidPrice: bigint; askPrice: bigint } {
+  const spread = BigInt(Math.round(Number(midPrice) * spreadFraction));
+  return {
+    spread,
+    bidPrice: midPrice - spread,
+    askPrice: midPrice + spread,
+  };
+}
+
+/**
+ * Cross-pool arbitrage profit as a fraction of the buy-side ask.
+ * profit = (sell price on A - buy price on B) / buy price on B.
+ * Returns 0 when the buy price is 0 (no opportunity / avoid div-by-zero).
+ */
+export function computeProfitFraction(bestBidA: bigint, bestAskB: bigint): number {
+  if (bestAskB <= 0n) return 0;
+  return Number(bestBidA - bestAskB) / Number(bestAskB);
+}
+
+/**
+ * Minimum acceptable output for an arbitrage buy on pool B that will be sold on
+ * pool A, applying a slippage tolerance.
+ *
+ * minOut = (bestBidA * capital / bestAskB) * (10000 - toleranceBps) / 10000
+ *
+ * Division is ordered so the price ratio is applied to capital BEFORE the
+ * slippage haircut, and the haircut uses basis points to stay in integer math.
+ */
+export function computeArbMinOut(
+  bestBidA: bigint,
+  bestAskB: bigint,
+  capital: bigint,
+  toleranceBps = 100n
+): bigint {
+  if (bestAskB <= 0n) return 0n;
+  const keepBps = 10_000n - toleranceBps;
+  return ((bestBidA * capital) / bestAskB) * keepBps / 10_000n;
+}
+
 /* ─── Strategy Base ────────────────────────────────────────────────── */
 
 export interface StrategyState {
@@ -121,15 +186,14 @@ export class MarketMakingStrategy extends BaseStrategy {
       // Calculate mid price from best bid/ask
       const bestBid = orderbook.bids[0]?.price ?? '0';
       const bestAsk = orderbook.asks[0]?.price ?? '0';
-      const midPrice =
-        BigInt(bestBid) > 0n && BigInt(bestAsk) > 0n
-          ? (BigInt(bestBid) + BigInt(bestAsk)) / 2n
-          : BigInt(1000); // default if no orders
+      const midPrice = computeMidPrice(BigInt(bestBid), BigInt(bestAsk));
 
-      const spread = BigInt(Math.round(Number(midPrice) * this.config.spreadFraction));
-
-      const bidPrice = (midPrice - spread).toString();
-      const askPrice = (midPrice + spread).toString();
+      const { bidPrice: bidP, askPrice: askP } = computeQuote(
+        midPrice,
+        this.config.spreadFraction
+      );
+      const bidPrice = bidP.toString();
+      const askPrice = askP.toString();
 
       this.log(
         `Mid: ${midPrice.toString()} | Bid: ${bidPrice} | Ask: ${askPrice}`
@@ -223,9 +287,7 @@ export class ArbitrageStrategy extends BaseStrategy {
           if (bestBidA === 0n || bestAskB === 0n) continue;
 
           // Check: buy on pool B (ask) and sell on pool A (bid)
-          const profitBasis = bestBidA - bestAskB;
-          const profitFraction =
-            bestAskB > 0n ? Number(profitBasis) / Number(bestAskB) : 0;
+          const profitFraction = computeProfitFraction(bestBidA, bestAskB);
 
           if (profitFraction > this.config.minProfitFraction) {
             // In-flight guard: skip if a prior arbitrage is still settling so the
@@ -242,7 +304,7 @@ export class ArbitrageStrategy extends BaseStrategy {
 
             // Execute the arbitrage
             const capital = BigInt(this.config.maxCapitalPerTrade);
-            const minOut = bestBidA * capital / bestAskB * BigInt(99) / 100n; // 1% slippage tolerance
+            const minOut = computeArbMinOut(bestBidA, bestAskB, capital, 100n); // 1% slippage tolerance
 
             const tx = this.ptbTrader.buildMarketOrderPTB({
               poolId: poolB,
