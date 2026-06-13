@@ -32,6 +32,17 @@ export interface HedgePTBParams {
   hedgePoolIds: PoolId[];
   hedgeAmount: string;
   hedgeRatio: number;
+  /**
+   * Observed best bid (output price) per hedge pool, keyed by pool id. Used to
+   * derive a non-zero minimum output so hedge swaps are protected against
+   * slippage / MEV extraction. Pools missing an entry fall back to a price of 0.
+   */
+  referencePrices: Record<PoolId, string>;
+  /**
+   * Maximum acceptable slippage as a fraction (e.g. 0.01 = 1%). Defaults to 1%.
+   * minOut = expectedOut * (1 - slippageTolerance).
+   */
+  slippageTolerance?: number;
   auditRef?: string;
 }
 
@@ -140,6 +151,13 @@ export class PTBTrader {
   buildHedgePTB(params: HedgePTBParams): Transaction {
     const tx = new Transaction();
 
+    // Slippage tolerance in basis points (default 1% = 100 bps), clamped to
+    // [0, 100%]. Using bps keeps the minOut computation in integer math.
+    const tolFraction = params.slippageTolerance ?? 0.01;
+    const clampedTol = Math.min(Math.max(tolFraction, 0), 1);
+    const toleranceBps = BigInt(Math.round(clampedTol * 10_000));
+    const keepBps = 10_000n - toleranceBps; // fraction of expected output we require
+
     for (const hedgePoolId of params.hedgePoolIds) {
       const hedgeAmount = BigInt(
         Math.round(
@@ -147,13 +165,20 @@ export class PTBTrader {
         )
       );
 
+      // Expected output for a sell ≈ amountIn * bestBid (price per base unit).
+      // Derive a non-zero minOut so the swap reverts under adverse price moves
+      // or MEV extraction beyond the configured slippage tolerance.
+      const refPrice = BigInt(params.referencePrices[hedgePoolId] ?? '0');
+      const expectedOut = hedgeAmount * refPrice;
+      const minOut = (expectedOut * keepBps) / 10_000n;
+
       const [outCoin] = tx.moveCall({
         target: `${DEEPBOOK_PACKAGE}::pool::swap_exact_input`,
         arguments: [
           tx.object(hedgePoolId),
           tx.pure.u8(1), // sell
           tx.pure.u64(hedgeAmount),
-          tx.pure.u64(0n), // no min out for hedge
+          tx.pure.u64(minOut),
         ],
       });
       tx.transferObjects([outCoin], tx.pure.address(this.client.address));
@@ -180,6 +205,44 @@ export interface WalrusStoreConfig {
   aggregatorUrl?: string;
 }
 
+/** Hard wall-clock deadline for a single Walrus HTTP attempt (ms). */
+const WALRUS_TIMEOUT_MS = 15_000;
+/** Max attempts (initial + retries) for transient Walrus failures. */
+const WALRUS_MAX_ATTEMPTS = 3;
+/** Base backoff delay; doubled each attempt (1s, 2s, 4s). */
+const WALRUS_BACKOFF_BASE_MS = 1_000;
+
+/**
+ * fetch wrapper enforcing a hard per-attempt timeout (via AbortController) and
+ * exponential-backoff retries. Prevents a stalled Walrus publisher/aggregator
+ * from blocking the audit path indefinitely.
+ */
+async function fetchWithTimeoutAndRetry(
+  url: string,
+  init: RequestInit,
+  label: string
+): Promise<Response> {
+  let lastErr: unknown;
+  for (let attempt = 1; attempt <= WALRUS_MAX_ATTEMPTS; attempt++) {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), WALRUS_TIMEOUT_MS);
+    try {
+      return await fetch(url, { ...init, signal: controller.signal });
+    } catch (err) {
+      lastErr = err;
+      if (attempt < WALRUS_MAX_ATTEMPTS) {
+        const delay = WALRUS_BACKOFF_BASE_MS * 2 ** (attempt - 1);
+        await new Promise((resolve) => setTimeout(resolve, delay));
+      }
+    } finally {
+      clearTimeout(timer);
+    }
+  }
+  throw new Error(
+    `${label} failed after ${WALRUS_MAX_ATTEMPTS} attempts: ${(lastErr as Error)?.message ?? lastErr}`
+  );
+}
+
 /**
  * Stores trading data on Walrus for a verifiable, permanent audit trail.
  *
@@ -202,11 +265,15 @@ export class WalrusAuditStore {
    * Returns the blob ID (used as on-chain reference).
    */
   async storeReport(report: TradingReport): Promise<string> {
-    const response = await fetch(this.publisherUrl, {
-      method: 'PUT',
-      body: JSON.stringify(report),
-      headers: { 'Content-Type': 'application/json' },
-    });
+    const response = await fetchWithTimeoutAndRetry(
+      this.publisherUrl,
+      {
+        method: 'PUT',
+        body: JSON.stringify(report),
+        headers: { 'Content-Type': 'application/json' },
+      },
+      'Walrus storeReport'
+    );
 
     if (!response.ok) {
       const text = await response.text();
@@ -227,10 +294,14 @@ export class WalrusAuditStore {
    * Store raw bytes on Walrus.
    */
   async storeBlob(data: Uint8Array): Promise<string> {
-    const response = await fetch(this.publisherUrl, {
-      method: 'PUT',
-      body: data,
-    });
+    const response = await fetchWithTimeoutAndRetry(
+      this.publisherUrl,
+      {
+        method: 'PUT',
+        body: data,
+      },
+      'Walrus storeBlob'
+    );
 
     if (!response.ok) {
       const text = await response.text();
@@ -252,8 +323,10 @@ export class WalrusAuditStore {
    */
   async retrieveReport(blobId: string): Promise<TradingReport | null> {
     try {
-      const response = await fetch(
-        `${this.aggregatorUrl}/v1/blobs/${blobId}`
+      const response = await fetchWithTimeoutAndRetry(
+        `${this.aggregatorUrl}/v1/blobs/${blobId}`,
+        { method: 'GET' },
+        'Walrus retrieveReport'
       );
       if (!response.ok) return null;
       return (await response.json()) as TradingReport;

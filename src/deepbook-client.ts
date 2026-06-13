@@ -36,6 +36,78 @@ export const DEEPBOOK_REGISTRY =
 /** Default gas budget for DeepBook transactions */
 const DEFAULT_GAS_BUDGET = 10_000_000n;
 
+/** Hard wall-clock deadline for a single RPC attempt (ms). */
+const RPC_TIMEOUT_MS = 30_000;
+/** Max attempts (initial + retries) for transient RPC failures. */
+const RPC_MAX_ATTEMPTS = 3;
+/** Base backoff delay; doubled each attempt (1s, 2s, 4s). */
+const RPC_BACKOFF_BASE_MS = 1_000;
+
+/**
+ * Heuristic: only retry errors that look transient (network / timeout / 5xx /
+ * rate-limit). Deterministic client-side failures (e.g. malformed object id,
+ * insufficient gas, invalid argument) will never succeed on retry, so we fail
+ * fast and avoid burning the backoff budget on them.
+ */
+function isRetryableError(err: unknown): boolean {
+  const msg = ((err as Error)?.message ?? String(err)).toLowerCase();
+  const nonRetryable = [
+    'invalid',
+    'not found',
+    'malformed',
+    'unauthorized',
+    'insufficient',
+    'bad request',
+    'parse',
+  ];
+  if (nonRetryable.some((s) => msg.includes(s))) return false;
+  return true;
+}
+
+/**
+ * Wrap a promise-returning operation with a hard wall-clock deadline and
+ * exponential-backoff retries. Prevents a stalled RPC node from freezing the
+ * strategy loops indefinitely (each attempt is bounded by `timeoutMs`).
+ * Non-transient errors (see `isRetryableError`) are rethrown immediately.
+ */
+export async function withTimeoutAndRetry<T>(
+  op: () => Promise<T>,
+  label: string,
+  opts: { timeoutMs?: number; maxAttempts?: number; backoffBaseMs?: number } = {}
+): Promise<T> {
+  const timeoutMs = opts.timeoutMs ?? RPC_TIMEOUT_MS;
+  const maxAttempts = opts.maxAttempts ?? RPC_MAX_ATTEMPTS;
+  const backoffBaseMs = opts.backoffBaseMs ?? RPC_BACKOFF_BASE_MS;
+
+  let lastErr: unknown;
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    try {
+      const timeout = new Promise<never>((_, reject) => {
+        timer = setTimeout(
+          () => reject(new DeepBookError(`${label} timed out after ${timeoutMs}ms`, 'RPC_TIMEOUT')),
+          timeoutMs
+        );
+      });
+      return await Promise.race([op(), timeout]);
+    } catch (err) {
+      lastErr = err;
+      if (!isRetryableError(err)) throw err;
+      if (attempt < maxAttempts) {
+        const delay = backoffBaseMs * 2 ** (attempt - 1);
+        await new Promise((resolve) => setTimeout(resolve, delay));
+      }
+    } finally {
+      if (timer) clearTimeout(timer);
+    }
+  }
+  throw new DeepBookError(
+    `${label} failed after ${maxAttempts} attempts: ${(lastErr as Error)?.message ?? lastErr}`,
+    'RPC_RETRY_EXHAUSTED',
+    lastErr
+  );
+}
+
 /* ─── Error Types ──────────────────────────────────────────────────── */
 
 export class DeepBookError extends Error {
@@ -123,10 +195,14 @@ export class DeepBookClient {
     tx.setSenderIfNotSet(this.address);
 
     // Execute with effects + events in the response
-    const result = await this.client.signAndExecuteTransaction({
-      signer: this.keypair,
-      transaction: tx,
-    });
+    const result = await withTimeoutAndRetry(
+      () =>
+        this.client.signAndExecuteTransaction({
+          signer: this.keypair!,
+          transaction: tx,
+        }),
+      'signAndExecuteTransaction'
+    );
 
     if (result.effects?.status?.status !== 'success') {
       throw new DeepBookError(
@@ -137,9 +213,13 @@ export class DeepBookClient {
     }
 
     // Wait for the transaction to settle
-    const txResult = await this.client.waitForTransaction({
-      digest: result.digest,
-    });
+    const txResult = await withTimeoutAndRetry(
+      () =>
+        this.client.waitForTransaction({
+          digest: result.digest,
+        }),
+      'waitForTransaction'
+    );
 
     if (txResult.effects?.status?.status !== 'success') {
       const error = txResult.effects?.status?.error ?? 'unknown error';
@@ -238,13 +318,17 @@ export class DeepBookClient {
    */
   async getOrderbook(poolId: PoolId): Promise<OrderbookSnapshot> {
     try {
-      const poolObj = await this.client.getObject({
-        id: poolId,
-        options: {
-          showContent: true,
-          showType: true,
-        },
-      });
+      const poolObj = await withTimeoutAndRetry(
+        () =>
+          this.client.getObject({
+            id: poolId,
+            options: {
+              showContent: true,
+              showType: true,
+            },
+          }),
+        `getObject(${poolId})`
+      );
 
       const content = poolObj?.data?.content;
       if (!content) {

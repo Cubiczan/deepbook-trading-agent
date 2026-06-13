@@ -156,6 +156,12 @@ export class MarketMakingStrategy extends BaseStrategy {
 export class ArbitrageStrategy extends BaseStrategy {
   private config: ArbitrageConfig;
   private lastSnapshots: Map<PoolId, OrderbookSnapshot> = new Map();
+  /**
+   * In-flight guard: true while an arbitrage execution is pending settlement.
+   * Prevents overlapping setInterval cycles from firing the same opportunity
+   * multiple times before the prior transaction settles (double-spend guard).
+   */
+  private isExecuting = false;
 
   constructor(
     client: DeepBookClient,
@@ -222,6 +228,13 @@ export class ArbitrageStrategy extends BaseStrategy {
             bestAskB > 0n ? Number(profitBasis) / Number(bestAskB) : 0;
 
           if (profitFraction > this.config.minProfitFraction) {
+            // In-flight guard: skip if a prior arbitrage is still settling so the
+            // same opportunity is not executed concurrently (double-spend guard).
+            if (this.isExecuting) {
+              this.log('Arbitrage opportunity skipped: prior execution still in flight');
+              continue;
+            }
+
             this.log(
               `Arbitrage opportunity! Buy ${poolB.slice(0, 8)} @ ${bestAskB.toString()} → ` +
               `Sell ${poolA.slice(0, 8)} @ ${bestBidA.toString()} (profit: ${(profitFraction * 100).toFixed(4)}%)`
@@ -238,11 +251,14 @@ export class ArbitrageStrategy extends BaseStrategy {
               minOut: minOut.toString(),
             });
 
+            this.isExecuting = true;
             this.client['executeTx'](tx).then((digest) => {
               this.state.totalTrades++;
               this.log(`Arbitrage executed (tx: ${digest.slice(0, 10)}...)`);
             }).catch((err) => {
               this.log(`Arbitrage execution failed: ${(err as Error).message}`);
+            }).finally(() => {
+              this.isExecuting = false;
             });
           }
         }
@@ -313,12 +329,22 @@ export class HedgeStrategy extends BaseStrategy {
 
       this.positionValue = midPrice;
 
+      // Fetch the observed best bid for each hedge pool so the hedge PTB can
+      // derive a non-zero minOut (slippage/MEV protection on every hedge swap).
+      const referencePrices: Record<PoolId, string> = {};
+      for (const hedgePoolId of this.config.hedgePools) {
+        const hedgeOb = await this.client.getOrderbook(hedgePoolId);
+        referencePrices[hedgePoolId] = hedgeOb.bids[0]?.price ?? '0';
+      }
+
       // Build hedge PTB
       const tx = this.ptbTrader.buildHedgePTB({
         positionPoolId: this.config.positionPoolId,
         hedgePoolIds: this.config.hedgePools,
         hedgeAmount: this.positionValue.toString(),
         hedgeRatio: this.config.hedgeRatio,
+        referencePrices,
+        slippageTolerance: this.config.slippageTolerance,
       });
 
       const digest = await this.client['executeTx'](tx);

@@ -48,6 +48,7 @@ describe('PTBTrader', () => {
       hedgePoolIds: [POOL_2, POOL_3],
       hedgeAmount: '10000',
       hedgeRatio: 0.5,
+      referencePrices: { [POOL_2]: '1000', [POOL_3]: '1000' },
     });
     expect(tx).toBeDefined();
   });

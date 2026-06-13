@@ -122,6 +122,11 @@ export interface HedgeConfig {
   hedgeRatio: number;
   /** Rebalance threshold for hedge adjustments */
   rebalanceThreshold: string;
+  /**
+   * Max acceptable slippage on hedge swaps as a fraction (e.g. 0.01 = 1%).
+   * Used to derive a non-zero minOut. Defaults to 1% when omitted.
+   */
+  slippageTolerance?: number;
 }
 
 export interface LiquidityConfig {
