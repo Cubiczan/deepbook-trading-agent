@@ -8,6 +8,7 @@
 import { Transaction } from '@mysten/sui/transactions';
 import type { PoolId, OrderSide, OrderbookSnapshot, TradingReport } from './types.js';
 import { DeepBookClient, DEEPBOOK_PACKAGE } from './deepbook-client.js';
+import { safeFetch } from './lib/resilience/index.js';
 
 /* ─── PTB Builder ──────────────────────────────────────────────────── */
 
@@ -216,31 +217,32 @@ const WALRUS_BACKOFF_BASE_MS = 1_000;
  * fetch wrapper enforcing a hard per-attempt timeout (via AbortController) and
  * exponential-backoff retries. Prevents a stalled Walrus publisher/aggregator
  * from blocking the audit path indefinitely.
+ *
+ * Delegates to the vendored {@link safeFetch} primitive (src/lib/resilience),
+ * which provides the AbortController timeout, backoff-with-jitter retry on
+ * 429/5xx + network errors, fail-fast on other 4xx, and an SSRF allowlist that
+ * fails closed for hosts outside `allowedHosts`.
  */
 async function fetchWithTimeoutAndRetry(
   url: string,
   init: RequestInit,
-  label: string
+  label: string,
+  allowedHosts: readonly string[]
 ): Promise<Response> {
-  let lastErr: unknown;
-  for (let attempt = 1; attempt <= WALRUS_MAX_ATTEMPTS; attempt++) {
-    const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), WALRUS_TIMEOUT_MS);
-    try {
-      return await fetch(url, { ...init, signal: controller.signal });
-    } catch (err) {
-      lastErr = err;
-      if (attempt < WALRUS_MAX_ATTEMPTS) {
-        const delay = WALRUS_BACKOFF_BASE_MS * 2 ** (attempt - 1);
-        await new Promise((resolve) => setTimeout(resolve, delay));
-      }
-    } finally {
-      clearTimeout(timer);
-    }
+  try {
+    return await safeFetch(url, {
+      ...init,
+      timeoutMs: WALRUS_TIMEOUT_MS,
+      maxAttempts: WALRUS_MAX_ATTEMPTS,
+      baseDelayMs: WALRUS_BACKOFF_BASE_MS,
+      allowlist: allowedHosts,
+    });
+  } catch (err) {
+    throw new Error(
+      `${label} failed: ${(err as Error)?.message ?? err}`,
+      { cause: err }
+    );
   }
-  throw new Error(
-    `${label} failed after ${WALRUS_MAX_ATTEMPTS} attempts: ${(lastErr as Error)?.message ?? lastErr}`
-  );
 }
 
 /**
@@ -253,11 +255,21 @@ async function fetchWithTimeoutAndRetry(
 export class WalrusAuditStore {
   private aggregatorUrl: string;
   private publisherUrl: string;
+  /**
+   * SSRF allowlist passed to safeFetch — only the configured Walrus hosts are
+   * reachable, so a tampered aggregator/publisher URL cannot redirect the audit
+   * path to an arbitrary internal endpoint. Fails closed.
+   */
+  private readonly allowedHosts: readonly string[];
 
   constructor(config: WalrusStoreConfig = {}) {
     this.aggregatorUrl =
       config.aggregatorUrl ?? 'https://aggregator.walrus-testnet.walrus.space';
     this.publisherUrl = 'https://publisher.walrus-testnet.walrus.space';
+    this.allowedHosts = [
+      new URL(this.aggregatorUrl).hostname,
+      new URL(this.publisherUrl).hostname,
+    ];
   }
 
   /**
@@ -272,7 +284,8 @@ export class WalrusAuditStore {
         body: JSON.stringify(report),
         headers: { 'Content-Type': 'application/json' },
       },
-      'Walrus storeReport'
+      'Walrus storeReport',
+      this.allowedHosts
     );
 
     if (!response.ok) {
@@ -300,7 +313,8 @@ export class WalrusAuditStore {
         method: 'PUT',
         body: data,
       },
-      'Walrus storeBlob'
+      'Walrus storeBlob',
+      this.allowedHosts
     );
 
     if (!response.ok) {
@@ -326,7 +340,8 @@ export class WalrusAuditStore {
       const response = await fetchWithTimeoutAndRetry(
         `${this.aggregatorUrl}/v1/blobs/${blobId}`,
         { method: 'GET' },
-        'Walrus retrieveReport'
+        'Walrus retrieveReport',
+        this.allowedHosts
       );
       if (!response.ok) return null;
       return (await response.json()) as TradingReport;

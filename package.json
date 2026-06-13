@@ -25,6 +25,9 @@
     "ptb"
   ],
   "license": "MIT",
+  "engines": {
+    "node": ">=20"
+  },
   "dependencies": {
     "@mysten/sui": "^2.17.0",
     "@mysten/walrus": "^1.1.0",
