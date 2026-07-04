@@ -46,6 +46,23 @@ export type {
   AgentSessionOptions,
 } from './agent-integration.js';
 
+export {
+  ChpGate,
+} from './chp/gate.js';
+export type {
+  ChpAction,
+  ChpState,
+  ProposedAction,
+  ChpDecision,
+  Provenance,
+  RiskPolicy,
+} from './chp/gate.js';
+export {
+  loadPolicy,
+  defaultPolicy,
+  defaultPolicyPath,
+} from './chp/policy.js';
+
 export type {
   PoolId,
   OrderId,

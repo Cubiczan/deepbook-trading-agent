@@ -22,6 +22,7 @@ import type {
   PoolId,
   AuditEntry,
 } from './types.js';
+import { ChpGate } from './chp/gate.js';
 
 /* ─── Agent Trading Session ────────────────────────────────────────── */
 
@@ -29,6 +30,11 @@ export interface AgentSessionOptions {
   client: DeepBookClient;
   config: TradingSessionConfig;
   walrusStore?: WalrusAuditStore;
+  /**
+   * CHP decision-governance gate. If omitted, a gate is created from
+   * config/policy.yaml (falling back to a conservative default policy).
+   */
+  chpGate?: ChpGate;
 }
 
 /**
@@ -49,12 +55,19 @@ export class AgentTradingSession {
   private results: TradeResult[] = [];
   private auditRefs: string[] = [];
   private activeStrategies: Map<string, MarketMakingStrategy | ArbitrageStrategy | HedgeStrategy | LiquidityStrategy> = new Map();
+  private chpGate: ChpGate;
 
   constructor(options: AgentSessionOptions) {
     this.client = options.client;
     this.ptbTrader = new PTBTrader(options.client);
     this.config = options.config;
     this.walrusStore = options.walrusStore ?? new WalrusAuditStore();
+    this.chpGate = options.chpGate ?? new ChpGate();
+  }
+
+  /** Expose the CHP gate (e.g. for provenance inspection / human approval). */
+  get chp(): ChpGate {
+    return this.chpGate;
   }
 
   get sessionId(): string {
@@ -79,8 +92,25 @@ export class AgentTradingSession {
     };
 
     try {
-      // 1. Validate
+      // 1. Validate against session config & risk limits
       this.validateDecision(decision);
+
+      // 1b. CHP decision gate (governance). Blocks or defers capital-moving
+      //     decisions whose notional breaches policy before any execution.
+      const notionalUsd = this.deriveNotional(decision);
+      const chp = this.chpGate.evaluate({
+        action: decision.action,
+        poolId: decision.poolId,
+        notionalUsd,
+        confidence: decision.confidence,
+        rationale: decision.reason,
+      });
+      if (!chp.allowed) {
+        const kind = chp.requiresHuman ? 'requires human approval' : 'blocked';
+        throw new Error(
+          `CHP gate ${kind} (${chp.state}): ${chp.reason} [decision ${chp.provenance.decisionId}]`,
+        );
+      }
 
       // 2. Execute
       switch (decision.action) {
@@ -200,6 +230,28 @@ export class AgentTradingSession {
     }
 
     return result;
+  }
+
+  /**
+   * Derive the notional value (quote asset) of a decision for the CHP gate.
+   * Reads the size field that is meaningful for each action type from
+   * `decision.params`, defaulting to 0 when no size is supplied.
+   */
+  private deriveNotional(decision: TradingDecision): number {
+    const p = decision.params;
+    const candidates = [
+      p['amount'],
+      p['maxCapitalPerTrade'],
+      p['positionSize'],
+      p['totalLiquidity'],
+      p['notional'],
+    ];
+    for (const c of candidates) {
+      if (c === undefined || c === null) continue;
+      const n = typeof c === 'number' ? c : Number(c);
+      if (Number.isFinite(n) && n > 0) return n;
+    }
+    return 0;
   }
 
   /**

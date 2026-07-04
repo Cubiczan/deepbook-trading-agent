@@ -1,0 +1,34 @@
+# ============================================================
+# deepbook-trading-agent — Decision Governance Policy (CHP gate)
+# Ported from the CleanMandate / SwarmFi-Executor CHP pattern.
+# Notional units are the pool quote asset (treated as USD-equivalent).
+# If this file is missing or unparseable, the gate falls back to a
+# conservative built-in default and logs a warning (src/chp/policy.ts).
+# ============================================================
+version: "1.0"
+
+# Hard ceiling on a single action's notional. Above this => BLOCKED.
+max_notional_usd: 50000.0
+
+# Cumulative notional allowed per rolling day.
+daily_notional_cap_usd: 250000.0
+
+# Human-in-the-loop threshold. At or above this notional the action
+# requires explicit human approval before it can LOCK.
+hitl_threshold_usd: 25000.0
+
+# Trading actions the agent is permitted to take.
+allowed_actions:
+  - swap
+  - market_make
+  - arbitrage
+  - hedge
+  - liquidity_provision
+
+# Per-pool notional caps. Pools omitted here fall back to
+# max_notional_usd. A pool mapped to 0 is effectively blocked.
+per_asset_limits: {}
+
+# Minimum decision confidence (0..1) for an action to pass the
+# adversarial sanity check.
+min_confidence: 0.5

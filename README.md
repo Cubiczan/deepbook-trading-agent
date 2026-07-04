@@ -232,12 +232,45 @@ This library is a **Sui native primitive** for building agentic trading systems:
 
 *\*Adaptation needed — this library is Sui-native.*
 
+## Decision Governance (CHP gate)
+
+Every capital-moving decision passes through a **CHP-style decision gate**
+(`src/chp/`) before execution — a TypeScript port of the Consensus Hardening
+Protocol pattern from the `cleanmandate` / `swarmfi-executor` donor repos.
+
+**Policy** lives in [`config/policy.yaml`](./config/policy.yaml):
+`max_notional_usd` (hard ceiling), `daily_notional_cap_usd`, `per_asset_limits`
+(per-pool caps), a `hitl_threshold_usd` above which human approval is required,
+`allowed_actions`, and `min_confidence`. If the file is missing or unparseable
+the gate falls back to a conservative built-in default and logs a warning
+(non-breaking, no YAML dependency added).
+
+**Gate** (`src/chp/gate.ts`) drives each proposed action through decision states
+`EXPLORING → PROVISIONAL → LOCKED` (or `HITL_REQUIRED` / `BLOCKED`), runs a
+lightweight adversarial/sanity check (finite non-negative notional, minimum
+confidence), and records per-decision provenance (UUID, timestamp, SHA-256
+content hash, per-claim results) in an append-only ledger.
+
+It is wired into `AgentTradingSession.executeAgentDecision()`: after the
+existing session/risk-limit validation, the decision's notional (derived from
+`params.amount` / `maxCapitalPerTrade` / `positionSize` / `totalLiquidity`) is
+run through `chpGate.evaluate(action)`. Blocked or HITL-required decisions are
+rejected before any PTB is submitted. Pass a custom gate via
+`new AgentTradingSession({ client, config, chpGate })`, and inspect provenance
+or grant approval via `session.chp`.
+
+```ts
+import { ChpGate, AgentTradingSession } from 'deepbook-trading-agent';
+const session = new AgentTradingSession({ client, config, chpGate: new ChpGate() });
+```
+
 ## Development
 
 ```bash
 pnpm install
 pnpm build
-pnpm test
+pnpm test                              # full suite (includes CHP gate)
+pnpm exec vitest run src/__tests__/chp-gate.test.ts   # CHP gate only
 
 # Run demo
 pnpm demo
