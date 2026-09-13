@@ -30,6 +30,7 @@ describe('confineToBase', () => {
     expect(confineToBase('config/../config/policy.yaml', base)).toBe(
       resolve(base, 'config', 'policy.yaml'),
     );
+    expect(confineToBase('...not-a-parent.yaml', base)).toBe(resolve(base, '...not-a-parent.yaml'));
   });
 
   it('rejects relative traversal, absolute escape, and NUL bytes', () => {

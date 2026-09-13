@@ -9,7 +9,7 @@
  */
 
 import { readFileSync, existsSync, realpathSync } from 'node:fs';
-import { isAbsolute, relative, resolve } from 'node:path';
+import { isAbsolute, relative, resolve, sep } from 'node:path';
 
 export type ChpAction =
   | 'swap'
@@ -66,7 +66,7 @@ export function confineToBase(candidate: string, baseDir: string): string | unde
   const base = resolve(baseDir);
   const resolved = resolve(base, candidate);
   const rel = relative(base, resolved);
-  if (rel === '' || rel.startsWith('..') || isAbsolute(rel)) {
+  if (rel === '' || rel === '..' || rel.startsWith(`..${sep}`) || isAbsolute(rel)) {
     return undefined;
   }
   return resolved;
