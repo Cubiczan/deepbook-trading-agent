@@ -8,8 +8,8 @@
  * parser keeps the change additive and dependency-free.
  */
 
-import { readFileSync, existsSync } from 'node:fs';
-import { resolve } from 'node:path';
+import { readFileSync, existsSync, realpathSync } from 'node:fs';
+import { isAbsolute, relative, resolve, sep } from 'node:path';
 
 export type ChpAction =
   | 'swap'
@@ -52,23 +52,60 @@ export function defaultPolicyPath(): string {
   return resolve(process.cwd(), 'config', 'policy.yaml');
 }
 
+/** In-tree base that policy files must resolve under (process cwd). */
+export function defaultPolicyBase(): string {
+  return resolve(process.cwd());
+}
+
+/**
+ * Resolve `candidate` and return it only if the result stays under `baseDir`.
+ * Rejects NUL bytes, `..` traversal, and absolute paths that escape the base.
+ */
+export function confineToBase(candidate: string, baseDir: string): string | undefined {
+  if (candidate.includes('\0')) return undefined;
+  const base = resolve(baseDir);
+  const resolved = resolve(base, candidate);
+  const rel = relative(base, resolved);
+  if (rel === '' || rel === '..' || rel.startsWith(`..${sep}`) || isAbsolute(rel)) {
+    return undefined;
+  }
+  return resolved;
+}
+
 /**
  * Load a risk policy from a flat YAML file. Returns a conservative default (and
- * logs a warning) if the file is missing or cannot be parsed — non-breaking.
+ * logs a warning) if the file is missing, escapes the working directory, or
+ * cannot be parsed — non-breaking.
  */
 export function loadPolicy(policyPath: string = defaultPolicyPath()): RiskPolicy {
-  if (!existsSync(policyPath)) {
+  const baseDir = defaultPolicyBase();
+  const safePath = confineToBase(policyPath, baseDir);
+  if (!safePath) {
     console.warn(
-      `[CHP] policy file not found at ${policyPath} — using conservative default policy`,
+      `[CHP] policy path rejected (escapes working directory): ${policyPath} — using conservative default policy`,
+    );
+    return defaultPolicy();
+  }
+  if (!existsSync(safePath)) {
+    console.warn(
+      `[CHP] policy file not found at ${safePath} — using conservative default policy`,
     );
     return defaultPolicy();
   }
   try {
-    const raw = readFileSync(policyPath, 'utf8');
+    // Re-check after symlink resolution so a link inside the tree cannot escape.
+    const real = realpathSync(safePath);
+    if (!confineToBase(real, baseDir)) {
+      console.warn(
+        `[CHP] policy path rejected (escapes working directory): ${policyPath} — using conservative default policy`,
+      );
+      return defaultPolicy();
+    }
+    const raw = readFileSync(real, 'utf8');
     return coercePolicy(parseFlatYaml(raw));
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
-    console.warn(`[CHP] failed to parse policy ${policyPath} (${msg}) — using default policy`);
+    console.warn(`[CHP] failed to parse policy ${safePath} (${msg}) — using default policy`);
     return defaultPolicy();
   }
 }
